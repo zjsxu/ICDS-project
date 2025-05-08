@@ -3,6 +3,12 @@ from PIL import Image, ImageTk
 import os
 import requests, io, base64
 import tkinter.messagebox as messagebox
+import os
+import sys
+import subprocess
+import threading
+import time
+import webbrowser
 
 
 
