@@ -6,8 +6,13 @@ import subprocess
 import sys
 import webbrowser
 import threading
+from chat_utils import S_OFFLINE, S_LOGGEDIN, S_CHATTING
 from chat_utils import *
 from indexer_student import *
+from client_state_machine import ClientSM
+from chat_server import Server
+import socket
+import json
 # imports for the neural network
 from flask import Flask, request, jsonify, send_from_directory
 import tensorflow as tf
@@ -17,6 +22,7 @@ import os
 from tensorflow import keras
 from PIL import Image, ImageTk, ImageGrab
 
+# READ THIS: before running this code, run the chat_server.py first to make sure it's listening thus we can log in
 
 # Constants (adjust paths as needed)
 SERVER = ('127.0.0.1', 12345)  # your chat server address
@@ -28,17 +34,43 @@ class YouAreAWizardHarry(tk.Tk):
         self.title("You're a wizard Harry")
         self.geometry("1000x600")
         self.configure(bg="#f5f7fa")
-        self.s = None  # Placeholder for socket
-        self.client_sm = None  # Placeholder for ClientSM
-        self.username = None  # Placeholder for username
+        # self.s = None  # Placeholder for socket
+        # self.client_sm = None  # Placeholder for ClientSM
+        # self.username = None  # Placeholder for username
         self.chat_display = None  # Placeholder for chat display widget
+        self.state_label = None  # and this is the placeholder for our state changing mathod
+# ask for username
+        self.username = simpledialog.askstring(
+            "Login", "Enter your username:", parent=self
+        )
+        if not self.username:
+            messagebox.showerror("Error", "Username required")
+            self.destroy()
+            return
+# then let's set self.s
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.s.connect(SERVER)  # SERVER = (host, port) tuple
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Cannot connect: {e}")
+            self.destroy()
+            return
+# now create an instance of ClientSM
+        self.client_sm = ClientSM(self.s)
+        self.client_sm.set_myname(self.username)
+
+        login_msg = json.dumps({"action": "login", "name": self.username})
+        mysend(self.s, login_msg)
+        resp = json.loads(myrecv(self.s))
+# and here we initialize the state, to make our conditions for client_state_machine fit
+        if resp.get("status") == "ok":
+            self.client_sm.set_state(S_LOGGEDIN)
+        else:
+            messagebox.showerror("Login Failed", "Server rejected login")
+            self.destroy()
+            return
 
 
-
-
-        # Socket & state machine omitted for brevity
-        # self.s = socket.socket(...)
-        # self.client_sm = ClientSM(self.s)
 
         self.sidebar_width = 160
         self.grid_columnconfigure(1, weight=1)
@@ -65,7 +97,9 @@ class YouAreAWizardHarry(tk.Tk):
             except Exception as e:
                 print(f"Connection error: {e}")
                 break
-# new
+        self.after(0, self.update_state_display)
+
+    # new
     def update_chat_display(self, text):
         if self.chat_display:
             self.chat_display.config(state=tk.NORMAL)
@@ -91,7 +125,7 @@ class YouAreAWizardHarry(tk.Tk):
         topbar.grid(row=0, column=0, columnspan=2, sticky="new")
         if self.icons.get("logo"):
             tk.Label(topbar, image=self.icons["logo"], bg="#3c8dbc").pack(side="left", padx=10)
-        tk.Label(topbar, text="Swish and Flick: Chat System", font=("Helvetica", 21), fg="white", bg="#3c8dbc").pack(side="left")
+        tk.Label(topbar, text="Swish and Flick: The Hogwarts Server System", font=("Helvetica", 21), fg="white", bg="#3c8dbc").pack(side="left")
 
     def create_sidebar(self):
         sidebar = tk.Frame(self, width=self.sidebar_width, bg="#ecf0f1")
@@ -99,7 +133,7 @@ class YouAreAWizardHarry(tk.Tk):
         buttons = [
             ("Chat", self.icons.get("chat"), self.show_chat),
             ("Tools", self.icons.get("tools"), self.show_tools),
-            ("Hand Written Digit Recognizer Demo", None, self.launch_server)
+            ("Hand Written Digit Recognizer Webpage Demo", None, self.launch_server)
         ]
         for label, icon, cmd in buttons:
             btn = tk.Button(
@@ -133,41 +167,82 @@ class YouAreAWizardHarry(tk.Tk):
         self.clear_content()
         tk.Label(self.content_frame, text="📨 Chat zone", font=("Arial", 16)).pack(pady=10)
 
+        # here we fill in the blank space for chat_display
+        self.chat_display = tk.Text(self.content_frame, state='disabled', wrap=tk.WORD, height=5)
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
+
+        # and we also need something to hold on to for the state of the user
+        self.state_label = tk.Label(self.content_frame, text="State: Unknown", font=("Arial", 12), anchor="w")
+        self.state_label.pack(pady=(5, 0))
+
+        # here, for further utility, we create a scrollable chat window
+        self.chat_display = tk.Text(self.content_frame, state='disabled', wrap=tk.WORD, height=15)
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
+
+        # here we create the input frame for entering text, which will be used as a parameter in the message entry part
+        input_frame = tk.Frame(self.content_frame)
+        input_frame.pack(fill=tk.X, pady=(5, 10))
+
+        # here we also add a place for entering chat messages
+        self.msg_entry = tk.Entry(input_frame)
+        self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.msg_entry.bind("<Return>", self.handle_chat)
+
         # Add chat buttons
-        for label in ["Chat", "Search", "Who", "Connect", "Disconnect"]:
-            tk.Button(
-                self.content_frame,
-                text=label,
-                width=25,
-                height=2,
-                bg="#f0f0f0"
-            ).pack(pady=5)
-
-            # Buttons
-            buttons = [
-                ("Who", lambda: self.send_command('who')),
-                ("Search", self.handle_search),
-                ("Connect", self.handle_connect),
-                ("Disconnect", lambda: self.send_command('bye')),
-            ]
+        # for label in ["Chat", "Search", "Who", "Connect", "Disconnect"]:
+        tk.Button(self.content_frame, text="Chat", command=self.handle_chat, width=25, height=2, bg="#f0f0f0").pack(pady=5)
+        tk.Button(self.content_frame, text="Search", command=self.handle_search, width = 25, height = 2, bg = "#f0f0f0").pack(pady=5)
+        tk.Button(self.content_frame, text="Check who's online (but not answering your texts 🤣)", command=self.handle_who, width = 35, height = 2, bg = "#f0f0f0").pack(pady=5)
+        tk.Button(self.content_frame, text="Connect", command=self.handle_connect, width = 25, height = 2, bg = "#f0f0f0").pack(pady=5)
+        tk.Button(self.content_frame, text="Disconnect", command=self.handle_disconnect, width = 25, height = 2, bg = "#f0f0f0").pack(pady=5)
 
 
-    def send_command(self, cmd):
-        def task():
-            self.client_sm.proc(cmd, '')
-            self.update_chat_display(self.client_sm.out_msg)
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def handle_search(self):
-        term = simpledialog.askstring("Search", "Enter term:")
-        if term:
-            self.send_command(f'? {term}')
+    def update_state_display(self):
+        names = {S_OFFLINE: 'Offline', S_LOGGEDIN: 'Logged In', S_CHATTING: 'Chatting'}
+        state_name = names.get(self.client_sm.get_state(), 'Unknown')
+        self.state_label.config(text=f"State: {state_name}")
 
     def handle_connect(self):
-        peer = simpledialog.askstring("Connect", "Peer name:")
-        if peer:
-            self.send_command(f'c {peer}')
+        peer = simpledialog.askstring("Connect", "Peer name:", parent=self)
+        if not peer:
+            return
+
+        connected = self.client_sm.connect_to(peer)
+        self.update_chat_display(self.client_sm.out_msg)
+
+        if connected:
+            self.client_sm.set_state(S_CHATTING)
+        self.update_state_display()
+
+    def handle_search(self):
+        term = simpledialog.askstring("Search", "Search term:", parent=self)
+        if not term:
+            return
+
+        self.client_sm.proc(f"?{term}", "")
+        self.update_chat_display(self.client_sm.out_msg)
+        self.update_state_display()
+
+    def handle_who(self):
+        self.client_sm.proc('who', '')
+        self.update_chat_display(self.client_sm.out_msg)
+        self.update_state_display()
+
+    def handle_disconnect(self):
+        self.client_sm.disconnect()
+        self.update_chat_display(self.client_sm.out_msg)
+        self.client_sm.set_state(S_LOGGEDIN)
+        self.update_state_display()
+
+    def handle_chat(self, event=None):
+        msg = simpledialog.askstring("Chat", "Enter your message:", parent=self)
+        if not msg:
+            return
+
+        self.client_sm.proc(msg, '')
+        self.update_chat_display(self.client_sm.out_msg)
+        self.update_state_display()
+
 
     def show_tools(self):
         self.clear_content()
@@ -178,7 +253,7 @@ class YouAreAWizardHarry(tk.Tk):
         tk.Button(self.content_frame, text="Get Poem", command=self.handle_poem, width=25, height=2, bg="#f0f0f0").pack(pady=5)
 
         # Add CNN canvas section
-        tk.Label(self.content_frame, text="✍ CNN Canvas: πlease draw your digit", font=("Arial", 14)).pack(pady=10)
+        tk.Label(self.content_frame, text='✍ CNN Canvas: "πlease" draw your digit', font=("Arial", 14)).pack(pady=10)
         self.canvas = tk.Canvas(self.content_frame, bg="white", width=200, height=200, relief="ridge", bd=2)
         self.canvas.pack(pady=5)
         self.canvas.bind("<B1-Motion>", self.paint)
